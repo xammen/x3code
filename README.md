@@ -139,3 +139,14 @@ Read [CONTRIBUTING.md](./CONTRIBUTING.md) before reporting a bug or opening a PR
 Have a feature request? Start an [Ideas discussion](https://github.com/pingdotgg/t3code/discussions/categories/ideas).
 
 Need support? Join the [Discord](https://discord.gg/jn4EGJjrvv).
+
+---
+
+## X3Code
+
+Windows-only fork of T3 Code that follows upstream `main` and ships its own nightly builds.
+
+- **Release train**: `.github/workflows/x3code-release.yml`. Daily (04:23 UTC) and on demand (Actions → X3Code Release → Run workflow, `force` on). It merges `pingdotgg/t3code@main`, then builds and publishes a `-nightly.` prerelease. The in-app updater follows this repo's releases.
+- **Secret `SYNC_TOKEN`** (PAT with `repo` + `workflow`): needed to push upstream merges that touch `.github/workflows`.
+- **Fork diff** is kept tiny on purpose: app id, product name and user-data folder (`scripts/build-desktop-artifact.ts`, `apps/desktop/src/app/DesktopEnvironment.ts`, `apps/desktop/src/app/DesktopUserData.ts`), plus the new workflow file.
+- Not enabled: signing, T3 Connect relay/Clerk, macOS/Linux/arm64 packaging.

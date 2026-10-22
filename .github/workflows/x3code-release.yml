@@ -1,0 +1,252 @@
+name: X3Code Release
+
+# X3Code's own release train (Windows x64 only for now). It lives in its own
+# file so merges from upstream never conflict with it; upstream's release.yml
+# stays in the tree but is gated to pingdotgg/t3code and never runs here.
+#
+# Once a day (or on demand) it merges upstream/main into main, and when that
+# produced a commit with no release yet (or when forced) it builds and
+# publishes a `-nightly.` prerelease. The app's updater feed defaults to
+# GITHUB_REPOSITORY, so installed X3Code builds follow these releases.
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build and publish even if this commit already has a release"
+        type: boolean
+        default: true
+
+concurrency:
+  group: x3code-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+  issues: write
+
+env:
+  UPSTREAM_REPOSITORY: pingdotgg/t3code
+
+jobs:
+  prepare:
+    name: Sync upstream and resolve release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      build: ${{ steps.release.outputs.build }}
+      ref: ${{ steps.release.outputs.ref }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      name: ${{ steps.release.outputs.name }}
+    steps:
+      # A token with the `workflow` scope (SYNC_TOKEN) is needed to push
+      # merges that touch .github/workflows; the default token cannot.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "x3code-sync"
+          git config user.email "x3code-sync@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream main
+          if git merge --no-edit upstream/main; then
+            git push origin HEAD:main
+          else
+            git merge --abort
+            gh issue create \
+              --title "Upstream sync conflict ($(date -u +%F))" \
+              --body "Merging \`${UPSTREAM_REPOSITORY}@$(git rev-parse --short upstream/main)\` into \`main\` conflicts. Resolve it locally with \`git fetch upstream && git merge upstream/main\`, push, then run **X3Code Release** manually." || true
+            echo "::error::Merge conflict with upstream/main"
+            exit 1
+          fi
+
+      - id: release
+        name: Resolve release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "ref=$sha" >> "$GITHUB_OUTPUT"
+
+          released="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[].target_commitish' | grep -cx "$sha" || true)"
+          if [[ "$FORCE" != "true" && "$released" != "0" ]]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Commit $sha already released, nothing to do."
+            exit 0
+          fi
+
+          base="$(jq -r .version apps/desktop/package.json)"
+          base="${base%%-*}"
+          version="${base}-nightly.$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}"
+          {
+            echo "build=true"
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "name=X3Code $version (${sha:0:12})"
+          } >> "$GITHUB_OUTPUT"
+
+  bundle:
+    name: Build JS bundle
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install bundle dependencies
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ needs.prepare.outputs.version }}"
+
+      # @t3tools/desktop#build compiles the Linux browser secret helper.
+      - name: Install browser secret helper build libraries
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+
+      - name: Build JS bundle
+        env:
+          T3CODE_TELEMETRY_CHANNEL: dev
+        run: vp run build:desktop
+
+      - name: Upload JS bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
+
+  # The Windows build embeds the Linux CLI archive as its WSL runtime and waits
+  # for the `cli-linux-x64` artifact, so this job has to run alongside it.
+  desktop_linux_x64:
+    name: Desktop Linux x64 (CLI archive)
+    needs: [prepare, bundle]
+    if: needs.prepare.outputs.build == 'true'
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ needs.prepare.outputs.ref }}
+      release_channel: nightly
+      clerk_publishable_key: ""
+      clerk_jwt_template: ""
+      clerk_cli_oauth_client_id: ""
+      relay_url: ""
+      relay_client_tracing: false
+      label: Linux x64
+      runner: ubuntu-latest
+      platform: linux
+      target: AppImage
+      arch: x64
+      rust_target: x86_64-unknown-linux-gnu
+      resource_key: linux-x64
+      cli_archive: true
+
+  desktop_win_x64:
+    name: Desktop Windows x64
+    needs: [prepare, bundle]
+    if: needs.prepare.outputs.build == 'true'
+    uses: ./.github/workflows/release-desktop.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ needs.prepare.outputs.ref }}
+      release_channel: nightly
+      clerk_publishable_key: ""
+      clerk_jwt_template: ""
+      clerk_cli_oauth_client_id: ""
+      relay_url: ""
+      relay_client_tracing: false
+      label: Windows x64
+      runner: ubuntu-latest
+      verify_runner: windows-2025
+      platform: win
+      target: nsis
+      arch: x64
+      rust_target: x86_64-pc-windows-msvc
+      resource_key: win32-x64
+      cli_archive: true
+
+  publish:
+    name: Publish GitHub Release
+    needs: [prepare, desktop_linux_x64, desktop_win_x64]
+    if: ${{ !failure() && !cancelled() && needs.prepare.outputs.build == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: desktop-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Download CLI archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: release-assets
+
+      # Windows only for now: the Linux job exists to feed the CLI archive.
+      - name: Drop Linux desktop files
+        run: |
+          cd release-assets
+          rm -f ./*.AppImage ./*.deb ./*-linux*.yml ./*AppImage*.blockmap
+          # electron-updater reads one manifest per platform; with a single
+          # arch the x64 one is simply the channel manifest.
+          shopt -s nullglob
+          for m in *-win-x64.yml; do mv "$m" "${m%-win-x64.yml}.yml"; done
+          sha256sum t3-*.tar.gz t3-*.zip > SHA256SUMS
+          ls -la
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ needs.prepare.outputs.ref }}
+          name: ${{ needs.prepare.outputs.name }}
+          generate_release_notes: true
+          prerelease: true
+          make_latest: false
+          files: |
+            release-assets/*.exe
+            release-assets/*.blockmap
+            release-assets/*.yml
+            release-assets/*.tar.gz
+            release-assets/*.zip
+            release-assets/SHA256SUMS
+          fail_on_unmatched_files: true
+          token: ${{ github.token }}
